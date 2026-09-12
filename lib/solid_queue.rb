@@ -94,8 +94,35 @@ module SolidQueue
     connects_to.is_a?(Hash) && connects_to.key?(:shards)
   end
 
+  # The shards receiving new work. Defaults to every shard in connects_to;
+  # set it explicitly to leave out a shard that stays connected but shouldn't
+  # take new jobs, such as one being drained before removal.
   def shards
-    sharded? ? connects_to[:shards].keys : []
+    @shards.presence&.map(&:to_sym) || (sharded? ? connects_to[:shards].keys : [])
+  end
+
+  attr_writer :shards, :previous_shards
+
+  # The split in effect before the last change to the shard list, kept during
+  # the transition so concurrency-controlled jobs keep meeting semaphores
+  # created under it. Remove it once `solid_queue:shards:status` reports the
+  # old shards clear; removing it early can at worst let a moved key exceed
+  # its limit for up to its duration, the same trade a non-graceful shutdown
+  # already makes.
+  def previous_shards
+    (@previous_shards || []).map(&:to_sym)
+  end
+
+  def shard_router
+    router_for(shards)
+  end
+
+  def previous_shard_router
+    router_for(previous_shards)
+  end
+
+  def router_for(shard_names)
+    (@routers ||= {})[shard_names] ||= MaglevHash.new(shard_names)
   end
 
   def deprecator
