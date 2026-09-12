@@ -53,7 +53,8 @@ Rails.application.configure do
     {
       shards: {
         queue_shard_one: { writing: :queue },
-        queue_shard_two: { writing: :queue_shard_two }
+        queue_shard_two: { writing: :queue_shard_two },
+        queue_shard_three: { writing: :queue_shard_three }
       }
     }
   else

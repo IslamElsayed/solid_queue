@@ -74,3 +74,8 @@ test:
     database: <%= database_name_from("test_queue_shard_two") %>
     migrations_paths: db/queue_migrate
     schema_dump: queue_schema.rb
+  queue_shard_three:
+    <<: *default
+    database: <%= database_name_from("test_queue_shard_three") %>
+    migrations_paths: db/queue_migrate
+    schema_dump: queue_schema.rb

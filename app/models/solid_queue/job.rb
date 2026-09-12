@@ -50,19 +50,44 @@ module SolidQueue
       end
 
       # The shard a job is enqueued in, where it will remain for its whole life.
-      # Jobs with concurrency controls are distributed by their concurrency key,
-      # so that jobs sharing a key land on the same shard and the unique indexes
-      # that enforce their limits apply to all of them. Other jobs are distributed
-      # uniformly by their Active Job ID; retried and resumed jobs keep it, so
-      # they return to their shard.
+      # Jobs joining a batch go where the batch lives, read from the batch's
+      # identifier, so a batch is unaffected by the shard list changing. Jobs
+      # with concurrency controls are distributed by their concurrency key, so
+      # that jobs sharing a key land on the same shard and the unique indexes
+      # that enforce their limits apply to all of them; while previous_shards
+      # is set after a change to the shard list, a moved key keeps routing to
+      # its old shard until no live semaphore remains there. Other jobs are
+      # distributed uniformly by their Active Job ID; retried and resumed jobs
+      # keep it, so they return to their shard.
       def shard_for(active_job)
-        shard_key = active_job.concurrency_key.presence || active_job.job_id
-        SolidQueue.shards[Zlib.crc32(shard_key.to_s) % SolidQueue.shards.size]
+        if Batch.migrated? && (batch_shard = Batch.shard_from(active_job.try(:batch_id)))
+          batch_shard
+        elsif active_job.concurrency_key.present?
+          shard_for_concurrency_key(active_job.concurrency_key)
+        else
+          SolidQueue.shard_router.node(active_job.job_id)
+        end
       end
 
       private
         DEFAULT_PRIORITY = 0
         DEFAULT_QUEUE_NAME = "default"
+
+        def shard_for_concurrency_key(concurrency_key)
+          shard = SolidQueue.shard_router.node(concurrency_key)
+          return shard if SolidQueue.previous_shards.empty?
+
+          previous_shard = SolidQueue.previous_shard_router.node(concurrency_key)
+          return shard if previous_shard == shard
+
+          live_semaphore_on?(previous_shard, concurrency_key) ? previous_shard : shard
+        end
+
+        def live_semaphore_on?(shard, concurrency_key)
+          Record.connected_to(shard: shard) do
+            Semaphore.where(key: concurrency_key).where("expires_at > ?", Time.current).exists?
+          end
+        end
 
         def connected_to_shard_for(active_job, &block)
           if SolidQueue.sharded?
@@ -109,7 +134,9 @@ module SolidQueue
             arguments: active_job.serialize,
             concurrency_key: active_job.concurrency_key
           }.tap do |attributes|
-            attributes[:batch_id] = active_job.batch_id if Batch.migrated?
+            # The Active Job level carries the batch's portable identifier; the
+            # column keeps the batch's row id, local to the shard both live on
+            attributes[:batch_id] = Batch.local_id_for(active_job.batch_id) if Batch.migrated?
           end
         end
     end

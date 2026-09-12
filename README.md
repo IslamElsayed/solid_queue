@@ -22,6 +22,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
   - [Queues specification and performance](#queues-specification-and-performance)
   - [Threads, processes, and signals](#threads-processes-and-signals)
   - [Database configuration](#database-configuration)
+  - [Sharding the queue database](#sharding-the-queue-database)
   - [Other configuration settings](#other-configuration-settings)
   - [Validating the configuration](#validating-the-configuration)
 - [Lifecycle hooks](#lifecycle-hooks)
@@ -427,6 +428,41 @@ queue:
   variables:
     transaction_isolation: READ-COMMITTED
 ```
+
+### Sharding the queue database
+
+When a single queue database can't keep up, Solid Queue can distribute jobs across several. Shards are configured the same way as in Solid Cache:
+
+```ruby
+config.solid_queue.connects_to = {
+  shards: {
+    queue_shard_one: { writing: :queue_shard_one },
+    queue_shard_two: { writing: :queue_shard_two }
+  }
+}
+```
+
+Every job picks its shard when it's enqueued and stays there for its whole life. Where it lands depends on what the job is:
+- Jobs belonging to a [batch](#batch-jobs) go where the batch lives. A batch picks its shard when it's created and writes it into its identifier, so everything joining later—members, retries, jobs added to a running batch, callback jobs looking their batch up—reads the shard from the identifier instead of computing it.
+- Jobs with [concurrency controls](#concurrency-controls) are distributed by their concurrency key, so all jobs sharing a key land on the same shard as the semaphore that enforces their limit.
+- All other jobs are distributed uniformly by their Active Job ID. Retried and resumed jobs keep it, so they return to their shard.
+
+Keys are mapped to shards with the same consistent hashing as Solid Cache, which keeps the disruption small when the list of shards changes: adding a shard relocates roughly `1/N` of the keys, and removing one relocates only its own.
+
+#### Adding and removing shards
+
+Jobs distributed by Active Job ID aren't tied to their shard in any way, so when the shard list changes, their future enqueues simply follow the new list. Batches aren't affected either: existing ones finish on the shard named in their identifier, and new ones follow the new list. Concurrency-controlled jobs are the ones that need care, since a key's jobs must keep meeting the semaphore that limits them. To protect them, keep the old shard list around while its keys drain:
+
+```ruby
+config.solid_queue.connects_to = { shards: { ... } } # with the new shard added
+config.solid_queue.previous_shards = [ :queue_shard_one, :queue_shard_two ] # the list as it was
+```
+
+While `previous_shards` is set, a concurrency key that the new list would send to a different shard keeps routing to its old one for as long as a live semaphore remains there; once that semaphore expires or clears, the key moves to its new home on its own. The only cost is one extra query when enqueuing jobs for the keys the change moved.
+
+Run `bin/rails solid_queue:shards:status` to see what still ties the old shards down: live semaphores for moved keys and, for shards no longer in the list, unfinished batches and pending jobs. Remove `previous_shards` when it reports all clear. There's no deadline to get right: removing it early can at worst let a moved key briefly exceed its limit, for up to its `duration`, the same trade-off described in [concurrency controls](#concurrency-controls) for a process dying without a clean shutdown, and leaving it in place only delays rebalancing keyed jobs.
+
+To remove a shard, take it out of new work first by setting `config.solid_queue.shards` to the list without it (it defaults to every shard in `connects_to`), keep it connected and keep its processes running until `solid_queue:shards:status` reports it empty, and then delete it from the configuration. Solid Queue never moves rows between shards.
 
 ### Other configuration settings
 

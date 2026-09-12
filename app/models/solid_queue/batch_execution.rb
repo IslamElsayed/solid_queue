@@ -43,8 +43,9 @@ module SolidQueue
 
     private
       def finish_batch
-        # Skip the serialized callback and metadata columns on this hot path
-        if batch = Batch.select(:id, :finished_at, :enqueued_at).find_by(id: batch_id)
+        # Skip the serialized callback and metadata columns on this hot path.
+        # The identifier rides along: finish connects to the batch's shard by it
+        if batch = Batch.select(:id, :active_job_batch_id, :finished_at, :enqueued_at).find_by(id: batch_id)
           batch.finish
         end
       end

@@ -38,9 +38,40 @@ module SolidQueue
         raise PendingMigrations unless migrated?
 
         new.tap do |batch|
+          batch.active_job_batch_id = generate_identifier
           batch.assign_attributes(description:, on_success:, on_failure:, on_finish:, metadata: (metadata || {}).merge(extra_metadata))
           batch.enqueue(&block)
         end
+      end
+
+      # A sharded batch's identifier names the shard picked when the batch is
+      # created, so everything joining later routes by reading it, never by
+      # hashing it against the current shard list. Batches are unaffected by
+      # that list changing.
+      def generate_identifier
+        uuid = SecureRandom.uuid
+        SolidQueue.sharded? ? "#{SolidQueue.shard_router.node(uuid)}:#{uuid}" : uuid
+      end
+
+      def shard_from(identifier)
+        shard, separator, _uuid = identifier.to_s.partition(":")
+        shard.to_sym if separator.present?
+      end
+
+      def connected_to_shard_of(identifier, &block)
+        if shard = shard_from(identifier)
+          Record.connected_to(shard: shard, &block)
+        else
+          yield
+        end
+      end
+
+      def locate(identifier)
+        connected_to_shard_of(identifier) { find_by(active_job_batch_id: identifier) }
+      end
+
+      def local_id_for(identifier)
+        where(active_job_batch_id: identifier).pick(:id) if identifier
       end
 
       def current_batch_id
@@ -63,13 +94,15 @@ module SolidQueue
         raise AlreadyFinished, "Can't enqueue an already finished batch"
       end
 
-      transaction do
-        save! if new_record?
+      connected_to_own_shard do
+        transaction do
+          save! if new_record?
 
-        self.class.wrap_in_batch_context(id) { block&.call(self) }
+          self.class.wrap_in_batch_context(active_job_batch_id) { block&.call(self) }
 
-        if ActiveRecord.respond_to?(:after_all_transactions_commit)
-          ActiveRecord.after_all_transactions_commit { start }
+          if ActiveRecord.respond_to?(:after_all_transactions_commit)
+            ActiveRecord.after_all_transactions_commit { start }
+          end
         end
       end
     end
@@ -78,26 +111,40 @@ module SolidQueue
       (super || {}).with_indifferent_access
     end
 
+    # Both start and finish connect to the batch's own shard themselves: they
+    # can run outside one, such as from an after-commit hook or a sweep.
     def start
-      mark_as_enqueued
+      connected_to_own_shard do
+        mark_as_enqueued
 
-      # Refresh enqueued_at after marking as enqueued, and let a batch that started
-      # with no jobs finish right away
-      reload
-      finish
+        # Refresh enqueued_at after marking as enqueued, and let a batch that started
+        # with no jobs finish right away
+        reload
+        finish
+      end
     end
 
     def finish
-      return if finished? || !enqueued?
-      return if batch_executions.exists?
-
-      transaction do
-        updated = Batch.where(id: id).unfinished.enqueued.without_executions.update_all(finished_at: Time.current)
-        finalize if updated > 0
+      connected_to_own_shard do
+        finish_on_own_shard
       end
     end
 
     private
+      def finish_on_own_shard
+        return if finished? || !enqueued?
+        return if batch_executions.exists?
+
+        transaction do
+          updated = Batch.where(id: id).unfinished.enqueued.without_executions.update_all(finished_at: Time.current)
+          finalize if updated > 0
+        end
+      end
+
+      def connected_to_own_shard(&block)
+        self.class.connected_to_shard_of(active_job_batch_id, &block)
+      end
+
       def set_active_job_batch_id
         self.active_job_batch_id ||= SecureRandom.uuid
       end

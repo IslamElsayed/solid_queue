@@ -37,7 +37,7 @@ module SolidQueue
         def enqueue_callback_job(callback_name)
           if callback = send(callback_name)
             active_job = ActiveJob::Base.deserialize(callback)
-            active_job.callback_batch_id = id
+            active_job.callback_batch_id = active_job_batch_id
             # Bypass the job class's adapter so callbacks stay in Solid Queue and
             # their enqueue stays in this transaction, while honoring enqueue callbacks.
             active_job.run_callbacks(:enqueue) do

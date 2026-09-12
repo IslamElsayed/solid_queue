@@ -45,7 +45,7 @@ module ActiveJob
       return @batch if defined?(@batch) && @loaded_batch_id == batch_id_to_load
 
       @loaded_batch_id = batch_id_to_load
-      @batch = SolidQueue::Batch.find_by(id: batch_id_to_load)
+      @batch = SolidQueue::Batch.locate(batch_id_to_load)
     end
 
     private
